@@ -1,0 +1,27 @@
+[package]
+name = "daw-nexus"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[dependencies]
+tracing = "0.1.40"
+bytes = "1.6.0"
+tokio = { version = "1.35.1", features = ["full"] }
+tracing-subscriber = { version = "0.3.18", features = ["env-filter", "json"] }
+tokio-rustls = "0.26.0"
+rustls = "0.23.12"
+tls-helpers = "0.1.3"
+xmpegts = { git = "https://github.com/wavey-ai/xiu" }
+#soundkit = "0.11.7"
+soundkit = { git = "https://github.com/wavey-ai/soundkit.git" }
+#soundkit = { path = "../../soundkit" }
+soundkit-opus = { git = "https://github.com/wavey-ai/soundkit-opus.git" }
+soundkit-flac = { git = "https://github.com/wavey-ai/soundkit-flac.git" }
+#soundkit-opus = { path = "../../soundkit-opus" }
+#soundkit-flac = { path = "../../soundkit-flac" }
+
+
+access-unit = "0.0.2"
+srt-tokio = "0.4.4"
+futures = "0.3.30"
