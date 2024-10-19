@@ -18,10 +18,12 @@ soundkit = { git = "https://github.com/wavey-ai/soundkit.git" }
 #soundkit = { path = "../../soundkit" }
 soundkit-opus = { git = "https://github.com/wavey-ai/soundkit-opus.git" }
 soundkit-flac = { git = "https://github.com/wavey-ai/soundkit-flac.git" }
+tcp-changes = { git = "https://github.com/wavey-ai/tcp-changes.git" }
+ts = { git = "https://github.com/wavey-ai/ts.git" }
 #soundkit-opus = { path = "../../soundkit-opus" }
 #soundkit-flac = { path = "../../soundkit-flac" }
-
-
-access-unit = "0.0.2"
 srt-tokio = "0.4.4"
 futures = "0.3.30"
+tokio-stream = "0.1.16"
+regex = "1.11.0"
+access-unit = { git = "https://github.com/wavey-ai/access-unit.git" }
