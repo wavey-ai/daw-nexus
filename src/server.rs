@@ -1,7 +1,10 @@
+use crate::allocator::{Channels, Streams};
 use access_unit::AccessUnit;
 use bytes::{Bytes, BytesMut};
 use futures::SinkExt;
+use gen_id::{ConfigPreset::ShortEpochMaxNodes, IdGenerator, DEFAULT_EPOCH};
 use regex::Regex;
+use rtrb::{Consumer, Producer, RingBuffer};
 use soundkit::audio_packet::{encode_audio_packet, Decoder, Encoder, FrameHeader};
 use soundkit::audio_types::EncodingFlag;
 use soundkit_flac::{FlacDecoder, FlacEncoder};
@@ -9,20 +12,28 @@ use soundkit_opus::OpusEncoder;
 use srt_tokio::SrtSocket;
 use std::net::SocketAddr;
 use std::str;
-use std::time::Instant;
+use std::sync::Arc;
 use tcp_changes::Payload;
 use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::sync::{oneshot, watch};
+use tokio::time::{self, Duration, Instant};
 use tokio_stream::StreamExt;
 use tracing::{error, info};
 use ts::demuxer::TsDemuxer;
 use xmpegts::{define::epsi_stream_type, ts::TsMuxer};
 
+const NUM_CHANNELS: usize = 16;
+
 struct Stream {}
 impl Stream {
-    async fn start(mut rx: mpsc::Receiver<Bytes>, stream_key: &str) -> Result<(), std::io::Error> {
+    async fn start(
+        mut rx: mpsc::Receiver<Bytes>,
+        stream_key: &str,
+        streams: Arc<Streams>,
+    ) -> Result<(), std::io::Error> {
         let (tx, mut rrx) = mpsc::channel::<AccessUnit>(32);
 
         let demux_tx = TsDemuxer::start(tx.clone());
@@ -33,15 +44,29 @@ impl Stream {
             .await
             .unwrap();
 
+        let streams_clone = streams.clone();
+
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
+            let gen = IdGenerator::new(ShortEpochMaxNodes, DEFAULT_EPOCH);
+
             rt.block_on(async {
                 let mut decoder = FlacDecoder::new();
                 decoder.init().expect("Decoder initialization failed");
 
+                let mut producers: Vec<Option<Producer<Bytes>>> =
+                    (0..NUM_CHANNELS).map(|_| None).collect();
+
                 while let Some(au) = rrx.recv().await {
                     let mut decoded_samples = vec![0i32; 1024 * 2];
-                    let header = FrameHeader::decode(&mut &au.data[..20]).unwrap();
+                    let header =
+                        FrameHeader::decode(&mut &au.data[..20]).expect("failed to decode header");
+                    let id = header.id().expect("failed to find id in header");
+                    let node_id = gen.decode_id(id).node_id as usize;
+                    if producers[node_id].is_none() {
+                        producers[node_id] = Some(streams_clone.add(node_id as usize));
+                    }
+
                     match decoder.decode_i32(&au.data, &mut decoded_samples, false) {
                         Ok(sample_count) => {
                             let mut result = Vec::with_capacity(sample_count);
@@ -49,9 +74,18 @@ impl Stream {
                                 let f32_sample = (s32_sample as f32) / (2.0f32.powi(23) - 1.0);
                                 result.extend_from_slice(&f32_sample.to_le_bytes());
                             }
-                            //   if let Err(e) = stx.try_send(result.clone()) {
-                            //       error!("error sending: {}", e);
-                            //   }
+
+                            if let Some(producer) = producers[node_id].as_mut() {
+                                match producer.write_chunk_uninit(result.len()) {
+                                    Ok(chunk) => {
+                                        let bytes_result = Bytes::copy_from_slice(&result);
+                                        chunk.fill_from_iter(std::iter::once(bytes_result));
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Error adding to rtrb: {}", e);
+                                    }
+                                }
+                            }
 
                             result.clear();
                         }
@@ -66,6 +100,7 @@ impl Stream {
                 result = socket.next() => {
                     match result {
                         Some(Ok((_, data))) => {
+
                             if let Err(e) = demux_tx.send(data).await {
                                  error!("Error sending to demuxer: {:?}", e);
                             }
@@ -81,7 +116,7 @@ impl Stream {
                 },
 
                 Some(data) = rx.recv() => {
-                   if let Err(e) = socket.send((Instant::now(), data)).await {
+                   if let Err(e) = socket.send((std::time::Instant::now(), data)).await {
                         error!("Error sending SRT packet {:?}", e);
                     }
                 }
@@ -135,14 +170,18 @@ impl Server {
 
         let (srt_tx, mut srt_rx) = mpsc::channel::<Bytes>(100);
 
+        let chans = Channels::new(NUM_CHANNELS);
+        let streams = Streams::new(NUM_CHANNELS);
+
         tokio::task::spawn(async move {
             while let Some(payload) = rx.recv().await {
                 if let Some(id) = extract_id(payload.val) {}
             }
         });
 
+        let streams_clone = streams.clone();
         tokio::task::spawn(async move {
-            Stream::start(srt_rx, "flac").await;
+            Stream::start(srt_rx, "flac", streams_clone).await;
         });
 
         let incoming = TcpListener::bind(addr).await.unwrap();
@@ -156,8 +195,10 @@ impl Server {
                             Ok((stream, _)) => {
                                 println!("accepting new connection!");
                                 let srt_tx = srt_tx.clone();
+                                let chans = chans.clone();
+                                let streams = streams.clone();
                                 tokio::task::spawn(async move {
-                                    stream_handler(stream, srt_tx).await;
+                                    stream_handler(stream, srt_tx, chans, streams).await;
                                 });
                             }
                             Err(err) => {
@@ -192,7 +233,12 @@ struct EncodeResponse {
     dts: u64,
 }
 
-async fn stream_handler(mut stream: TcpStream, tx: mpsc::Sender<Bytes>) {
+async fn stream_handler(
+    mut stream: TcpStream,
+    tx: mpsc::Sender<Bytes>,
+    chans: Arc<Channels>,
+    streams: Arc<Streams>,
+) {
     let (encode_tx, mut encode_rx) = mpsc::channel::<EncodeRequest>(100);
     let (response_tx, mut response_rx) = mpsc::channel::<EncodeResponse>(100);
 
@@ -258,6 +304,45 @@ async fn stream_handler(mut stream: TcpStream, tx: mpsc::Sender<Bytes>) {
         .add_stream(epsi_stream_type::PSI_STREAM_AAC, BytesMut::new())
         .unwrap();
 
+    let mut initial_buffer = [0u8; 4]; // Buffer to read "HELO"
+    if let Err(e) = stream.read_exact(&mut initial_buffer).await {
+        error!("Failed to read initial HELO message: {:?}", e);
+        return;
+    }
+
+    let id = chans.next();
+
+    if let Some(id) = id {
+        match &initial_buffer {
+            b"SEND" => {
+                if let Err(e) = stream.write_all(&(id as u16).to_le_bytes()).await {
+                    error!("Failed to send ID back to client: {:?}", e);
+                    chans.rm(id).expect("failed to remove channel counter");
+                }
+            }
+            b"PLAY" => {
+                if let Some(mut consumer) = streams.take_consumer(id) {
+                    let mut next_instant = Instant::now() + Duration::from_millis(5);
+                    loop {
+                        tokio::time::sleep_until(next_instant).await;
+                        next_instant += Duration::from_millis(2);
+                        if let Ok(data) = consumer.pop() {
+                            if let Err(e) = stream.write_all(&data).await {
+                                error!("Failed to send ID back to client: {:?}", e);
+                                chans.rm(id).expect("failed to remove channel counter");
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    } else {
+        error!("No available channels");
+        return;
+    }
+
     loop {
         tokio::select! {
             read_result = stream.read(&mut read_buf) => {
@@ -276,7 +361,7 @@ async fn stream_handler(mut stream: TcpStream, tx: mpsc::Sender<Bytes>) {
                                 }
                                 let mut buf_cursor = &buffer[..];
                                 let h = FrameHeader::decode(&mut buf_cursor).unwrap();
-                                current_frame_length = Some(h.size() + (h.sample_size() * h.channels() as u16 * 4) as usize);
+                                                             current_frame_length = Some(h.size() + (h.sample_size() * h.channels() as u16 * 4) as usize);
                                 ms = (h.sample_size() as u64 * 1000) / h.sample_rate() as u64;
                             }
                             if let Some(len) = current_frame_length {
@@ -320,6 +405,10 @@ async fn stream_handler(mut stream: TcpStream, tx: mpsc::Sender<Bytes>) {
                 }
             }
         }
+    }
+
+    if let Some(id) = id {
+        chans.rm(id).expect("failed to remove channel counter");
     }
 
     println!("closed connection");
@@ -395,7 +484,7 @@ mod tests {
         // Address of the server (change to the actual server address)
         let server_addr = "127.0.0.1:4242";
 
-        // Send the sine wave data to the server
+        // Sed the sine wave data to the server
         match send_audio_data(server_addr, &sine_wave).await {
             Ok(_) => println!("Successfully sent sine wave to the server."),
             Err(e) => eprintln!("Failed to send sine wave: {:?}", e),
